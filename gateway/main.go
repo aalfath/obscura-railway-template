@@ -1,5 +1,9 @@
 // obscura-gateway: the public front door for Obscura on Railway.
 //
+// MCP runs on demand (see mcpManager) and every browser session takes one
+// memory slot, so a small service refuses extra sessions instead of being
+// killed for running out of memory.
+//
 // It runs as PID 1 and
 //   - starts `obscura serve` (CDP) on 127.0.0.1:9222 and `obscura mcp --http`
 //     on 127.0.0.1:3000 as the unprivileged user 65532, each with a random
@@ -34,6 +38,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -52,7 +57,129 @@ var (
 	mcpToken    string
 	version     = "dev"
 	shuttingDown atomic.Bool
+	sessionSlots chan struct{}
+	mcpIdle      = 180 * time.Second
+	mcpMgr       *mcpManager
 )
+
+func clamp(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+func busy(w http.ResponseWriter, why string) {
+	w.Header().Set("Retry-After", "30")
+	http.Error(w, fmt.Sprintf("obscura is busy: %s (%d at a time with this service's memory). Close a session, wait for the MCP server to go idle (%v), or give the service more memory.", why, cap(sessionSlots), mcpIdle), http.StatusServiceUnavailable)
+}
+
+// mcpManager runs `obscura mcp --http` on demand. While it runs it holds one
+// session slot; after mcpIdle without requests it is stopped (SIGTERM, so the
+// profile is flushed) and the slot and its memory are freed.
+type mcpManager struct {
+	mu       sync.Mutex
+	args     []string
+	cmd      *exec.Cmd
+	inflight int
+	lastUse  time.Time
+	stopping bool
+	exited   chan string
+}
+
+func (m *mcpManager) running() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cmd != nil && !m.stopping
+}
+
+func (m *mcpManager) begin() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cmd == nil || m.stopping {
+		if m.stopping {
+			return fmt.Errorf("the MCP server is restarting, retry in a few seconds")
+		}
+		select {
+		case sessionSlots <- struct{}{}:
+		default:
+			return fmt.Errorf("all browser sessions are in use, so the MCP server can't start")
+		}
+		cmd := child("mcp", m.args, []string{"OBSCURA_MCP_TOKEN=" + mcpToken, "OBSCURA_STORAGE_DIR=" + dataRoot + "/mcp-profile"})
+		if err := cmd.Start(); err != nil {
+			<-sessionSlots
+			return fmt.Errorf("start MCP server: %v", err)
+		}
+		m.cmd = cmd
+		go m.wait(cmd)
+		deadline := time.Now().Add(20 * time.Second)
+		for mcpHealthy() != nil {
+			if time.Now().After(deadline) {
+				return fmt.Errorf("the MCP server did not start in time")
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	m.inflight++
+	m.lastUse = time.Now()
+	return nil
+}
+
+func (m *mcpManager) end() {
+	m.mu.Lock()
+	m.inflight--
+	m.lastUse = time.Now()
+	m.mu.Unlock()
+}
+
+func (m *mcpManager) wait(cmd *exec.Cmd) {
+	err := cmd.Wait()
+	m.mu.Lock()
+	intended := m.stopping && m.cmd == cmd
+	if m.cmd == cmd {
+		m.cmd = nil
+		m.stopping = false
+		<-sessionSlots
+	}
+	m.mu.Unlock()
+	if intended {
+		log.Printf("MCP server stopped after %v idle (memory released)", mcpIdle)
+		return
+	}
+	if !shuttingDown.Load() {
+		m.exited <- fmt.Sprintf("obscura mcp exited: %v", err)
+	}
+}
+
+func (m *mcpManager) idleLoop() {
+	for range time.Tick(5 * time.Second) {
+		m.mu.Lock()
+		if m.cmd != nil && !m.stopping && m.inflight == 0 && time.Since(m.lastUse) > mcpIdle {
+			m.stopping = true
+			syscall.Kill(-m.cmd.Process.Pid, syscall.SIGTERM)
+			go func(c *exec.Cmd) {
+				time.Sleep(10 * time.Second)
+				m.mu.Lock()
+				if m.cmd == c {
+					syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
+				}
+				m.mu.Unlock()
+			}(m.cmd)
+		}
+		m.mu.Unlock()
+	}
+}
+
+func (m *mcpManager) signal(sig syscall.Signal) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cmd != nil && m.cmd.Process != nil {
+		syscall.Kill(-m.cmd.Process.Pid, sig)
+	}
+}
 
 func randomHex(n int) string {
 	b := make([]byte, n)
@@ -307,32 +434,30 @@ func main() {
 	mcpToken = randomHex(32)
 	port := envOr("PORT", "8080")
 
-	// Size Obscura to the service's memory limit.
+	// Size Obscura to the service's memory limit. A heavy page (GitHub, with
+	// a screenshot) costs about 250 MB in one Obscura process, so every live
+	// browser session (a CDP WebSocket, or the MCP server while in use) takes
+	// one slot of about 250 MB above a ~120 MB base. More sessions than slots
+	// get a clear 503 instead of an out-of-memory kill.
 	limit := memoryLimitMB()
-	heapMB, maxConn := 1024, 16
+	heapMB, slots := 1024, 16
 	if limit > 0 {
-		heapMB = limit * 2 / 5
-		if heapMB < 128 {
-			heapMB = 128
-		}
-		if heapMB > 2048 {
-			heapMB = 2048
-		}
-		maxConn = limit / 128
-		if maxConn < 2 {
-			maxConn = 2
-		}
-		if maxConn > 64 {
-			maxConn = 64
+		heapMB = clamp(limit*2/5, 128, 2048)
+		slots = clamp((limit-120)/250, 1, 64)
+	}
+	if v := os.Getenv("OBSCURA_MAX_SESSIONS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			slots = n
 		}
 	}
-	if v := os.Getenv("OBSCURA_MAX_CONNECTIONS"); v != "" {
+	sessionSlots = make(chan struct{}, slots)
+	if v := os.Getenv("OBSCURA_MCP_IDLE_SECONDS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			maxConn = n
+			mcpIdle = time.Duration(n) * time.Second
 		}
 	}
 	v8flags := envOr("OBSCURA_V8_FLAGS", fmt.Sprintf("--max-old-space-size=%d", heapMB))
-	log.Printf("obscura-gateway %s: memory limit %d MB -> V8 old space %d MB per isolate, %d CDP connections max", version, limit, heapMB, maxConn)
+	log.Printf("obscura-gateway %s: memory limit %d MB -> %d browser session(s) at a time, V8 old space %d MB per isolate, MCP stops after %v idle", version, limit, slots, heapMB, mcpIdle)
 
 	prepareDir(dataRoot + "/cdp-profile")
 	prepareDir(dataRoot + "/mcp-profile")
@@ -346,24 +471,18 @@ func main() {
 	}
 
 	serveArgs := append(append([]string{}, global...), "serve", "--host", "127.0.0.1", "--port", "9222",
-		"--storage-dir", dataRoot+"/cdp-profile", "--max-connections", strconv.Itoa(maxConn))
+		"--storage-dir", dataRoot+"/cdp-profile", "--max-connections", strconv.Itoa(slots))
 	mcpArgs := append(append([]string{}, global...), "mcp", "--http", "--host", "127.0.0.1", "--port", "3000")
 
 	cdp := child("cdp", serveArgs, []string{"OBSCURA_CDP_TOKEN=" + cdpToken})
-	mcp := child("mcp", mcpArgs, []string{"OBSCURA_MCP_TOKEN=" + mcpToken, "OBSCURA_STORAGE_DIR=" + dataRoot + "/mcp-profile"})
 	if err := cdp.Start(); err != nil {
 		log.Printf("FATAL: start obscura serve: %v", err)
 		os.Exit(1)
 	}
-	if err := mcp.Start(); err != nil {
-		log.Printf("FATAL: start obscura mcp: %v", err)
-		cdp.Process.Kill()
-		os.Exit(1)
-	}
-
-	exited := make(chan string, 2)
+	exited := make(chan string, 4)
 	go func() { err := cdp.Wait(); exited <- fmt.Sprintf("obscura serve exited: %v", err) }()
-	go func() { err := mcp.Wait(); exited <- fmt.Sprintf("obscura mcp exited: %v", err) }()
+	mcpMgr = &mcpManager{args: mcpArgs, exited: exited}
+	go mcpMgr.idleLoop()
 
 	cdpProxy := newProxy(cdpAddr, cdpToken, true)
 	mcpProxy := newProxy(mcpAddr, mcpToken, false)
@@ -374,19 +493,33 @@ func main() {
 			http.Error(w, "cdp: "+err.Error(), http.StatusServiceUnavailable)
 			return
 		}
-		if err := mcpHealthy(); err != nil {
-			http.Error(w, "mcp: "+err.Error(), http.StatusServiceUnavailable)
-			return
-		}
 		io.WriteString(w, "ok\n")
 	})
 	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodOptions {
-			if ok, _ := authorized(r); !ok {
-				unauthorized(w)
+		if r.Method == http.MethodOptions {
+			mcpProxy.ServeHTTP(w, r)
+			return
+		}
+		if ok, _ := authorized(r); !ok {
+			unauthorized(w)
+			return
+		}
+		if r.Method != http.MethodPost {
+			// Obscura's optional GET event stream only carries keep-alives.
+			// Serve it while the MCP server runs; never start it for a GET.
+			if r.Method == http.MethodGet && mcpMgr.running() {
+				mcpProxy.ServeHTTP(w, r)
 				return
 			}
+			w.Header().Set("Allow", "POST, OPTIONS")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
 		}
+		if err := mcpMgr.begin(); err != nil {
+			busy(w, err.Error())
+			return
+		}
+		defer mcpMgr.end()
 		mcpProxy.ServeHTTP(w, r)
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -416,6 +549,15 @@ func main() {
 			r = r.WithContext(ctx)
 			r.Header.Del("Accept-Encoding")
 		}
+		if isWebSocket(r) {
+			select {
+			case sessionSlots <- struct{}{}:
+				defer func() { <-sessionSlots }()
+			default:
+				busy(w, "all browser sessions are in use")
+				return
+			}
+		}
 		cdpProxy.ServeHTTP(w, r)
 	})
 
@@ -428,7 +570,6 @@ func main() {
 	if err != nil {
 		log.Printf("FATAL: listen :%s: %v", port, err)
 		cdp.Process.Kill()
-		mcp.Process.Kill()
 		os.Exit(1)
 	}
 	go func() {
@@ -445,11 +586,8 @@ func main() {
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
 
 	stop := func() {
-		for _, c := range []*exec.Cmd{cdp, mcp} {
-			if c.Process != nil {
-				syscall.Kill(-c.Process.Pid, syscall.SIGTERM)
-			}
-		}
+		syscall.Kill(-cdp.Process.Pid, syscall.SIGTERM)
+		mcpMgr.signal(syscall.SIGTERM)
 	}
 	select {
 	case s := <-sigs:
@@ -459,14 +597,11 @@ func main() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		srv.Shutdown(ctx)
 		cancel()
-		deadline := time.After(8 * time.Second)
-		for i := 0; i < 2; i++ {
-			select {
-			case <-exited:
-			case <-deadline:
-				i = 2
-			}
+		select {
+		case <-exited:
+		case <-time.After(8 * time.Second):
 		}
+		time.Sleep(time.Second)
 		os.Exit(0)
 	case why := <-exited:
 		// Any unexpected exit, even with status 0, is a failure: exit non-zero
@@ -474,11 +609,8 @@ func main() {
 		log.Printf("FATAL: %s; stopping so Railway restarts the service", why)
 		stop()
 		time.Sleep(2 * time.Second)
-		for _, c := range []*exec.Cmd{cdp, mcp} {
-			if c.Process != nil {
-				syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
-			}
-		}
+		syscall.Kill(-cdp.Process.Pid, syscall.SIGKILL)
+		mcpMgr.signal(syscall.SIGKILL)
 		os.Exit(1)
 	}
 }
