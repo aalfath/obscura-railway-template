@@ -18,7 +18,7 @@ COPY --from=gateway /obscura-gateway /obscura-gateway
 # both Obscura processes as the image's unprivileged user (uid 65532).
 USER 0
 ENV PORT=8080 \
-    RUST_LOG=warn \
+    RUST_LOG=warn,usvg=error \
     MALLOC_ARENA_MAX=2
 EXPOSE 8080
 ENTRYPOINT ["/obscura-gateway"]
