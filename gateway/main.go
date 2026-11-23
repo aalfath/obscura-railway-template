@@ -498,17 +498,27 @@ func logStats() {
 		stat := read("/sys/fs/cgroup/memory.stat")
 		ev := read("/sys/fs/cgroup/memory.events")
 		threads := 0
+		procs := []string{}
 		if ents, err := os.ReadDir("/proc"); err == nil {
 			for _, e := range ents {
 				if _, err := strconv.Atoi(e.Name()); err == nil {
-					n, _ := strconv.Atoi(field(read("/proc/"+e.Name()+"/status"), "Threads"))
+					st := read("/proc/" + e.Name() + "/status")
+					n, _ := strconv.Atoi(field(st, "Threads"))
 					threads += n
+					cmd := strings.Fields(strings.ReplaceAll(read("/proc/"+e.Name()+"/cmdline"), "\x00", " "))
+					name := field(st, "Name")
+					for _, a := range cmd {
+						if a == "serve" || a == "mcp" {
+							name = a
+						}
+					}
+					procs = append(procs, fmt.Sprintf("%s:%skB/%sthr", name, field(st, "VmRSS"), field(st, "Threads")))
 				}
 			}
 		}
-		log.Printf("stats: memory.current=%s peak=%s anon=%s anon_thp=%s file=%s oom_kill=%s threads=%d",
+		log.Printf("stats: memory.current=%s peak=%s anon=%s anon_thp=%s file=%s oom_kill=%s threads=%d %s",
 			read("/sys/fs/cgroup/memory.current"), read("/sys/fs/cgroup/memory.peak"),
-			field(stat, "anon"), field(stat, "anon_thp"), field(stat, "file"), field(ev, "oom_kill"), threads)
-		time.Sleep(30 * time.Second)
+			field(stat, "anon"), field(stat, "anon_thp"), field(stat, "file"), field(ev, "oom_kill"), threads, strings.Join(procs, " "))
+		time.Sleep(15 * time.Second)
 	}
 }
